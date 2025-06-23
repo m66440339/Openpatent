@@ -116,4 +116,3 @@ Query contract state without transactions:
 - **MIN_USAGE_FEE**: 1,000,000 microSTX (1 STX)
 - **MIN_STAKE_AMOUNT**: 10,000,000 microSTX (10 STX)
 - **VOTING_PERIOD**: 1,008 blocks (~1 week)
-ZZ

@@ -8,15 +8,26 @@
 (define-constant ERR_VOTING_ENDED (err u106))
 (define-constant ERR_ALREADY_VOTED (err u107))
 (define-constant ERR_INSUFFICIENT_STAKE (err u108))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u109))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u110))
+(define-constant ERR_DISPUTE_CLOSED (err u111))
+(define-constant ERR_NOT_ARBITRATOR (err u112))
+(define-constant ERR_ALREADY_RESPONDED (err u113))
+(define-constant ERR_DISPUTE_ACTIVE (err u114))
+(define-constant ERR_INSUFFICIENT_BOND (err u115))
 
 (define-constant MIN_PATENT_DURATION u144)
 (define-constant MAX_PATENT_DURATION u52560)
 (define-constant MIN_USAGE_FEE u1000000)
 (define-constant MIN_STAKE_AMOUNT u10000000)
 (define-constant VOTING_PERIOD u1008)
+(define-constant DISPUTE_BOND_AMOUNT u50000000)
+(define-constant ARBITRATION_PERIOD u504)
+(define-constant ARBITRATOR_REWARD_PERCENT u10)
 
 (define-data-var next-patent-id uint u1)
 (define-data-var dao-treasury uint u0)
+(define-data-var next-dispute-id uint u1)
 
 (define-map patents
   { patent-id: uint }
@@ -64,6 +75,45 @@
 (define-map user-stakes
   { user: principal }
   { amount: uint, locked-until: uint }
+)
+
+(define-map patent-disputes
+  { dispute-id: uint }
+  {
+    disputant: principal,
+    patent-id: uint,
+    patent-owner: principal,
+    dispute-type: (string-ascii 30),
+    reason: (string-ascii 500),
+    evidence-hash: (string-ascii 64),
+    created-at: uint,
+    arbitration-deadline: uint,
+    arbitrator: (optional principal),
+    disputant-bond: uint,
+    owner-bond: uint,
+    status: (string-ascii 20),
+    ruling: (optional bool),
+    compensation-amount: uint
+  }
+)
+
+(define-map dispute-responses
+  { dispute-id: uint }
+  {
+    response: (string-ascii 500),
+    counter-evidence-hash: (string-ascii 64),
+    submitted-at: uint
+  }
+)
+
+(define-map arbitrators
+  { arbitrator: principal }
+  {
+    active: bool,
+    cases-handled: uint,
+    reputation-score: uint,
+    locked-stake: uint
+  }
 )
 
 (define-data-var next-proposal-id uint u1)
@@ -304,6 +354,215 @@
     patent (and (get is-active patent) (< stacks-block-height (get expires-at patent)))
     false
   )
+)
+
+(define-public (file-patent-dispute (patent-id uint) (dispute-type (string-ascii 30)) (reason (string-ascii 500)) (evidence-hash (string-ascii 64)))
+  (let
+    (
+      (dispute-id (var-get next-dispute-id))
+      (patent (unwrap! (map-get? patents { patent-id: patent-id }) ERR_PATENT_NOT_FOUND))
+      (current-block stacks-block-height)
+      (existing-dispute (map-get? patent-disputes { dispute-id: dispute-id }))
+    )
+    (asserts! (not (is-eq tx-sender (get owner patent))) ERR_UNAUTHORIZED)
+    (asserts! (is-none existing-dispute) ERR_DISPUTE_ALREADY_EXISTS)
+    
+    (try! (stx-transfer? DISPUTE_BOND_AMOUNT tx-sender (as-contract tx-sender)))
+    
+    (map-set patent-disputes
+      { dispute-id: dispute-id }
+      {
+        disputant: tx-sender,
+        patent-id: patent-id,
+        patent-owner: (get owner patent),
+        dispute-type: dispute-type,
+        reason: reason,
+        evidence-hash: evidence-hash,
+        created-at: current-block,
+        arbitration-deadline: (+ current-block ARBITRATION_PERIOD),
+        arbitrator: none,
+        disputant-bond: DISPUTE_BOND_AMOUNT,
+        owner-bond: u0,
+        status: "open",
+        ruling: none,
+        compensation-amount: u0
+      }
+    )
+    
+    (var-set next-dispute-id (+ dispute-id u1))
+    (ok dispute-id)
+  )
+)
+
+(define-public (respond-to-dispute (dispute-id uint) (response (string-ascii 500)) (counter-evidence-hash (string-ascii 64)))
+  (let
+    (
+      (dispute (unwrap! (map-get? patent-disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+      (current-block stacks-block-height)
+      (existing-response (map-get? dispute-responses { dispute-id: dispute-id }))
+    )
+    (asserts! (is-eq tx-sender (get patent-owner dispute)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status dispute) "open") ERR_DISPUTE_CLOSED)
+    (asserts! (is-none existing-response) ERR_ALREADY_RESPONDED)
+    (asserts! (< current-block (get arbitration-deadline dispute)) ERR_VOTING_ENDED)
+    
+    (try! (stx-transfer? DISPUTE_BOND_AMOUNT tx-sender (as-contract tx-sender)))
+    
+    (map-set dispute-responses
+      { dispute-id: dispute-id }
+      {
+        response: response,
+        counter-evidence-hash: counter-evidence-hash,
+        submitted-at: current-block
+      }
+    )
+    
+    (map-set patent-disputes
+      { dispute-id: dispute-id }
+      (merge dispute {
+        owner-bond: DISPUTE_BOND_AMOUNT,
+        status: "awaiting-arbitration"
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (register-arbitrator)
+  (let
+    (
+      (arbitrator-key { arbitrator: tx-sender })
+      (existing-arbitrator (map-get? arbitrators arbitrator-key))
+      (user-stake (unwrap! (map-get? user-stakes { user: tx-sender }) ERR_INSUFFICIENT_STAKE))
+    )
+    (asserts! (>= (get amount user-stake) (* MIN_STAKE_AMOUNT u5)) ERR_INSUFFICIENT_STAKE)
+    (asserts! (is-none existing-arbitrator) ERR_DISPUTE_ALREADY_EXISTS)
+    
+    (map-set arbitrators
+      arbitrator-key
+      {
+        active: true,
+        cases-handled: u0,
+        reputation-score: u100,
+        locked-stake: (get amount user-stake)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (assign-arbitrator (dispute-id uint))
+  (let
+    (
+      (dispute (unwrap! (map-get? patent-disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+      (arbitrator-data (unwrap! (map-get? arbitrators { arbitrator: tx-sender }) ERR_NOT_ARBITRATOR))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq (get status dispute) "awaiting-arbitration") ERR_DISPUTE_CLOSED)
+    (asserts! (get active arbitrator-data) ERR_NOT_ARBITRATOR)
+    (asserts! (is-none (get arbitrator dispute)) ERR_DISPUTE_ALREADY_EXISTS)
+    (asserts! (< current-block (get arbitration-deadline dispute)) ERR_VOTING_ENDED)
+    
+    (map-set patent-disputes
+      { dispute-id: dispute-id }
+      (merge dispute {
+        arbitrator: (some tx-sender),
+        status: "under-arbitration"
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute (dispute-id uint) (ruling bool) (compensation-amount uint))
+  (let
+    (
+      (dispute (unwrap! (map-get? patent-disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+      (arbitrator-data (unwrap! (map-get? arbitrators { arbitrator: tx-sender }) ERR_NOT_ARBITRATOR))
+      (current-block stacks-block-height)
+      (arbitrator-reward (/ (* (+ (get disputant-bond dispute) (get owner-bond dispute)) ARBITRATOR_REWARD_PERCENT) u100))
+      (total-bonds (+ (get disputant-bond dispute) (get owner-bond dispute)))
+    )
+    (asserts! (is-eq (get status dispute) "under-arbitration") ERR_DISPUTE_CLOSED)
+    (asserts! (is-eq (some tx-sender) (get arbitrator dispute)) ERR_NOT_ARBITRATOR)
+    (asserts! (>= current-block (get arbitration-deadline dispute)) ERR_VOTING_ENDED)
+    
+    (map-set patent-disputes
+      { dispute-id: dispute-id }
+      (merge dispute {
+        status: "resolved",
+        ruling: (some ruling),
+        compensation-amount: compensation-amount
+      })
+    )
+    
+    (map-set arbitrators
+      { arbitrator: tx-sender }
+      (merge arbitrator-data {
+        cases-handled: (+ (get cases-handled arbitrator-data) u1),
+        reputation-score: (if ruling 
+          (+ (get reputation-score arbitrator-data) u10)
+          (+ (get reputation-score arbitrator-data) u5)
+        )
+      })
+    )
+    
+    (if ruling
+      (begin
+        (try! (as-contract (stx-transfer? (get disputant-bond dispute) tx-sender (get disputant dispute))))
+        (try! (as-contract (stx-transfer? compensation-amount tx-sender (get disputant dispute))))
+        (try! (as-contract (stx-transfer? arbitrator-reward tx-sender tx-sender)))
+        (try! (as-contract (stx-transfer? (- (get owner-bond dispute) compensation-amount arbitrator-reward) tx-sender (get patent-owner dispute))))
+      )
+      (begin
+        (try! (as-contract (stx-transfer? (get owner-bond dispute) tx-sender (get patent-owner dispute))))
+        (try! (as-contract (stx-transfer? arbitrator-reward tx-sender tx-sender)))
+        (try! (as-contract (stx-transfer? (- (get disputant-bond dispute) arbitrator-reward) tx-sender (get patent-owner dispute))))
+      )
+    )
+    
+    (ok ruling)
+  )
+)
+
+(define-public (withdraw-dispute (dispute-id uint))
+  (let
+    (
+      (dispute (unwrap! (map-get? patent-disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get disputant dispute)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status dispute) "open") ERR_DISPUTE_ACTIVE)
+    (asserts! (is-none (map-get? dispute-responses { dispute-id: dispute-id })) ERR_ALREADY_RESPONDED)
+    
+    (map-set patent-disputes
+      { dispute-id: dispute-id }
+      (merge dispute { status: "withdrawn" })
+    )
+    
+    (try! (as-contract (stx-transfer? (get disputant-bond dispute) tx-sender (get disputant dispute))))
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? patent-disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (get-dispute-response (dispute-id uint))
+  (map-get? dispute-responses { dispute-id: dispute-id })
+)
+
+(define-read-only (get-arbitrator (arbitrator principal))
+  (map-get? arbitrators { arbitrator: arbitrator })
+)
+
+(define-read-only (get-next-dispute-id)
+  (var-get next-dispute-id)
 )
 
 (define-read-only (get-dao-treasury)

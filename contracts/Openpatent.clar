@@ -15,6 +15,13 @@
 (define-constant ERR_ALREADY_RESPONDED (err u113))
 (define-constant ERR_DISPUTE_ACTIVE (err u114))
 (define-constant ERR_INSUFFICIENT_BOND (err u115))
+(define-constant ERR_COLLABORATION_NOT_FOUND (err u116))
+(define-constant ERR_COLLABORATION_EXISTS (err u117))
+(define-constant ERR_INVALID_PERCENTAGE (err u118))
+(define-constant ERR_POOL_NOT_FOUND (err u119))
+(define-constant ERR_POOL_EXISTS (err u120))
+(define-constant ERR_PATENT_IN_POOL (err u121))
+(define-constant ERR_INSUFFICIENT_EARNINGS (err u122))
 
 (define-constant MIN_PATENT_DURATION u144)
 (define-constant MAX_PATENT_DURATION u52560)
@@ -28,6 +35,7 @@
 (define-data-var next-patent-id uint u1)
 (define-data-var dao-treasury uint u0)
 (define-data-var next-dispute-id uint u1)
+(define-data-var next-pool-id uint u1)
 
 (define-map patents
   { patent-id: uint }
@@ -113,6 +121,49 @@
     cases-handled: uint,
     reputation-score: uint,
     locked-stake: uint
+  }
+)
+
+(define-map patent-collaborations
+  { patent-id: uint, collaborator: principal }
+  {
+    revenue-share-percent: uint,
+    joined-at: uint,
+    is-active: bool,
+    earnings-accumulated: uint
+  }
+)
+
+(define-map collaboration-invites
+  { patent-id: uint, invitee: principal }
+  {
+    inviter: principal,
+    revenue-share-percent: uint,
+    created-at: uint,
+    expires-at: uint
+  }
+)
+
+(define-map patent-pools
+  { pool-id: uint }
+  {
+    creator: principal,
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    total-patents: uint,
+    total-revenue: uint,
+    pool-fee: uint,
+    created-at: uint,
+    is-active: bool
+  }
+)
+
+(define-map pool-memberships
+  { pool-id: uint, patent-id: uint }
+  {
+    owner: principal,
+    revenue-share-percent: uint,
+    joined-at: uint
   }
 )
 
@@ -561,6 +612,225 @@
   (map-get? arbitrators { arbitrator: arbitrator })
 )
 
+(define-public (invite-collaborator (patent-id uint) (invitee principal) (revenue-share-percent uint))
+  (let
+    (
+      (patent (unwrap! (map-get? patents { patent-id: patent-id }) ERR_PATENT_NOT_FOUND))
+      (current-block stacks-block-height)
+      (invite-key { patent-id: patent-id, invitee: invitee })
+      (existing-invite (map-get? collaboration-invites invite-key))
+      (existing-collaboration (map-get? patent-collaborations { patent-id: patent-id, collaborator: invitee }))
+    )
+    (asserts! (is-eq tx-sender (get owner patent)) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq tx-sender invitee)) ERR_UNAUTHORIZED)
+    (asserts! (and (> revenue-share-percent u0) (<= revenue-share-percent u50)) ERR_INVALID_PERCENTAGE)
+    (asserts! (is-none existing-invite) ERR_COLLABORATION_EXISTS)
+    (asserts! (is-none existing-collaboration) ERR_COLLABORATION_EXISTS)
+    
+    (map-set collaboration-invites
+      invite-key
+      {
+        inviter: tx-sender,
+        revenue-share-percent: revenue-share-percent,
+        created-at: current-block,
+        expires-at: (+ current-block u144)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (accept-collaboration (patent-id uint))
+  (let
+    (
+      (invite-key { patent-id: patent-id, invitee: tx-sender })
+      (invite (unwrap! (map-get? collaboration-invites invite-key) ERR_COLLABORATION_NOT_FOUND))
+      (patent (unwrap! (map-get? patents { patent-id: patent-id }) ERR_PATENT_NOT_FOUND))
+      (current-block stacks-block-height)
+      (collaboration-key { patent-id: patent-id, collaborator: tx-sender })
+    )
+    (asserts! (< current-block (get expires-at invite)) ERR_VOTING_ENDED)
+    (asserts! (is-none (map-get? patent-collaborations collaboration-key)) ERR_COLLABORATION_EXISTS)
+    
+    (map-set patent-collaborations
+      collaboration-key
+      {
+        revenue-share-percent: (get revenue-share-percent invite),
+        joined-at: current-block,
+        is-active: true,
+        earnings-accumulated: u0
+      }
+    )
+    
+    (map-delete collaboration-invites invite-key)
+    (ok true)
+  )
+)
+
+(define-public (create-patent-pool (name (string-ascii 50)) (description (string-ascii 200)) (pool-fee uint))
+  (let
+    (
+      (pool-id (var-get next-pool-id))
+      (current-block stacks-block-height)
+    )
+    (asserts! (>= pool-fee MIN_USAGE_FEE) ERR_INSUFFICIENT_PAYMENT)
+    
+    (map-set patent-pools
+      { pool-id: pool-id }
+      {
+        creator: tx-sender,
+        name: name,
+        description: description,
+        total-patents: u0,
+        total-revenue: u0,
+        pool-fee: pool-fee,
+        created-at: current-block,
+        is-active: true
+      }
+    )
+    
+    (var-set next-pool-id (+ pool-id u1))
+    (ok pool-id)
+  )
+)
+
+(define-public (add-patent-to-pool (pool-id uint) (patent-id uint) (revenue-share-percent uint))
+  (let
+    (
+      (pool (unwrap! (map-get? patent-pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (patent (unwrap! (map-get? patents { patent-id: patent-id }) ERR_PATENT_NOT_FOUND))
+      (membership-key { pool-id: pool-id, patent-id: patent-id })
+      (existing-membership (map-get? pool-memberships membership-key))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get owner patent)) ERR_UNAUTHORIZED)
+    (asserts! (get is-active pool) ERR_POOL_NOT_FOUND)
+    (asserts! (get is-active patent) ERR_PATENT_NOT_FOUND)
+    (asserts! (and (> revenue-share-percent u0) (<= revenue-share-percent u100)) ERR_INVALID_PERCENTAGE)
+    (asserts! (is-none existing-membership) ERR_PATENT_IN_POOL)
+    
+    (map-set pool-memberships
+      membership-key
+      {
+        owner: tx-sender,
+        revenue-share-percent: revenue-share-percent,
+        joined-at: current-block
+      }
+    )
+    
+    (map-set patent-pools
+      { pool-id: pool-id }
+      (merge pool { total-patents: (+ (get total-patents pool) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (license-patent-pool (pool-id uint))
+  (let
+    (
+      (pool (unwrap! (map-get? patent-pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (get is-active pool) ERR_POOL_NOT_FOUND)
+    (asserts! (> (get total-patents pool) u0) ERR_POOL_NOT_FOUND)
+    
+    (try! (stx-transfer? (get pool-fee pool) tx-sender (get creator pool)))
+    
+    (map-set patent-pools
+      { pool-id: pool-id }
+      (merge pool { total-revenue: (+ (get total-revenue pool) (get pool-fee pool)) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (distribute-collaboration-revenue (patent-id uint))
+  (let
+    (
+      (patent (unwrap! (map-get? patents { patent-id: patent-id }) ERR_PATENT_NOT_FOUND))
+      (collaboration-key { patent-id: patent-id, collaborator: tx-sender })
+      (collaboration (unwrap! (map-get? patent-collaborations collaboration-key) ERR_COLLABORATION_NOT_FOUND))
+      (total-revenue (get total-revenue patent))
+      (share-amount (/ (* total-revenue (get revenue-share-percent collaboration)) u100))
+      (current-earnings (get earnings-accumulated collaboration))
+      (new-earnings (- share-amount current-earnings))
+    )
+    (asserts! (get is-active collaboration) ERR_COLLABORATION_NOT_FOUND)
+    (asserts! (> new-earnings u0) ERR_INSUFFICIENT_EARNINGS)
+    
+    (map-set patent-collaborations
+      collaboration-key
+      (merge collaboration { earnings-accumulated: share-amount })
+    )
+    
+    (try! (stx-transfer? new-earnings (get owner patent) tx-sender))
+    (ok new-earnings)
+  )
+)
+
+(define-public (withdraw-collaboration-earnings (patent-id uint))
+  (let
+    (
+      (collaboration-key { patent-id: patent-id, collaborator: tx-sender })
+      (collaboration (unwrap! (map-get? patent-collaborations collaboration-key) ERR_COLLABORATION_NOT_FOUND))
+      (earnings (get earnings-accumulated collaboration))
+    )
+    (asserts! (get is-active collaboration) ERR_COLLABORATION_NOT_FOUND)
+    (asserts! (> earnings u0) ERR_INSUFFICIENT_EARNINGS)
+    
+    (map-set patent-collaborations
+      collaboration-key
+      (merge collaboration { earnings-accumulated: u0 })
+    )
+    
+    (try! (as-contract (stx-transfer? earnings tx-sender tx-sender)))
+    (ok earnings)
+  )
+)
+
+(define-public (remove-collaborator (patent-id uint) (collaborator principal))
+  (let
+    (
+      (patent (unwrap! (map-get? patents { patent-id: patent-id }) ERR_PATENT_NOT_FOUND))
+      (collaboration-key { patent-id: patent-id, collaborator: collaborator })
+      (collaboration (unwrap! (map-get? patent-collaborations collaboration-key) ERR_COLLABORATION_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner patent)) ERR_UNAUTHORIZED)
+    (asserts! (get is-active collaboration) ERR_COLLABORATION_NOT_FOUND)
+    
+    (map-set patent-collaborations
+      collaboration-key
+      (merge collaboration { is-active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-collaboration (patent-id uint) (collaborator principal))
+  (map-get? patent-collaborations { patent-id: patent-id, collaborator: collaborator })
+)
+
+(define-read-only (get-collaboration-invite (patent-id uint) (invitee principal))
+  (map-get? collaboration-invites { patent-id: patent-id, invitee: invitee })
+)
+
+(define-read-only (get-patent-pool (pool-id uint))
+  (map-get? patent-pools { pool-id: pool-id })
+)
+
+(define-read-only (get-pool-membership (pool-id uint) (patent-id uint))
+  (map-get? pool-memberships { pool-id: pool-id, patent-id: patent-id })
+)
+
+(define-read-only (get-next-pool-id)
+  (var-get next-pool-id)
+)
+
 (define-read-only (get-next-dispute-id)
   (var-get next-dispute-id)
 )
@@ -568,3 +838,5 @@
 (define-read-only (get-dao-treasury)
   (var-get dao-treasury)
 )
+
+
